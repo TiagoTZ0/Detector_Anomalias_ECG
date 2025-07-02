@@ -10,13 +10,12 @@ import json
 import streamlit as st
 from sklearn.preprocessing import StandardScaler
 import tempfile
-import subprocess
-import sys
 import pickle
 
 # Importar módulos personalizados
 from preprocesado import bandpass_filter, extract_features, segment_signal
 from visualizacion import plot_anomaly_results
+from entrenamiento import train_model  # Importa la función directamente
 
 def get_custom_objects():
     """Crear y retornar objetos personalizados para el modelo"""
@@ -25,86 +24,71 @@ def get_custom_objects():
         mse = MeanSquaredError()
         @tf.function
         def loss(y_true, y_pred):
-            # MSE básico
             mse_loss = mse(y_true, y_pred)
-            # Calcular gradientes usando diferencias finitas
             grad_true = tf.reduce_mean(tf.square(y_true[:, 1:] - y_true[:, :-1]), axis=1)
             grad_pred = tf.reduce_mean(tf.square(y_pred[:, 1:] - y_pred[:, :-1]), axis=1)
             gradient_loss = tf.reduce_mean(tf.square(grad_true - grad_pred))
             return mse_loss + 0.1 * gradient_loss
         loss.__name__ = 'custom_loss'
         return loss
-    # Crear instancia de la función de pérdida
     loss_fn = custom_loss()
     return {
         'custom_loss': loss_fn,
         'loss': loss_fn
     }
 
-# Obtener los objetos personalizados al inicio
 custom_objects = get_custom_objects()
 
-def run_training(csv_path, epochs=150, multiplier=1.2, validation=0.2, segment_length=160, overlap=0.5):
-    """Ejecuta el script de entrenamiento como un subproceso"""
-    try:
-        result = subprocess.run([
-            sys.executable, "entrenamiento.py",
-            "--csv", csv_path,
-            "--epochs", str(epochs),
-            "--multiplier", str(multiplier),
-            "--validation", str(validation),
-            "--segment_length", str(segment_length),
-            "--overlap", str(overlap)
-        ], capture_output=True, text=True)
-        if result.returncode == 0:
-            return True
-        else:
-            st.error(f"Error en entrenamiento:\n{result.stderr}")
-            return False
-    except Exception as e:
-        st.error(f"Error al ejecutar entrenamiento: {e}")
-        return False
-
 def detect_anomaly_in_ecg(file_path, model_path="infogenerada/ecg_autoencoder_model.h5", threshold=None):
-    """Detectar anomalías en un archivo ECG"""
+    """Detectar anomalías en un archivo ECG (procesando toda la señal)"""
     try:
-        # Verificar que el modelo existe
         if not os.path.exists(model_path):
             st.error(f"No se encuentra el modelo en {model_path}")
             return None
-        # Cargar datos
+
+        # --- Leer el archivo CSV y extraer solo columnas numéricas ---
         if file_path.endswith('.csv'):
             try:
                 data = pd.read_csv(file_path)
-                if data.empty:
-                    st.error("El archivo CSV está vacío.")
+                # Seleccionar solo columnas numéricas
+                numeric_data = data.select_dtypes(include=[np.number])
+                if numeric_data.empty:
+                    st.error("El archivo CSV no contiene columnas numéricas.")
                     return None
-                # Asegurar que tenemos datos numéricos en la primera columna
-                raw_signal = data.iloc[:, 0].values.astype(float)
-                if len(data.columns) > 1:
-                    st.warning("El archivo tiene múltiples columnas. Se usará la primera columna.")
+                raw_signal = numeric_data.iloc[:, 0].values.astype(float)
+                if len(numeric_data.columns) > 1:
+                    st.warning("El archivo tiene múltiples columnas numéricas. Se usará la primera columna numérica.")
             except Exception as e:
                 st.error(f"Error al leer el archivo CSV: {str(e)}")
                 return None
         else:
             st.error("El archivo debe ser CSV.")
             return None
-        # Preprocesar señal
+
         filtered_signal = bandpass_filter(raw_signal)
-        # Cargar scaler
         scaler_path = 'infogenerada/ecg_scaler.pkl'
         if os.path.exists(scaler_path):
             try:
                 with open(scaler_path, 'rb') as f:
                     scaler = pickle.load(f)
-                normalized_signal = scaler.transform(filtered_signal.reshape(-1, 1)).flatten()
+                n_features = getattr(scaler, 'n_features_in_', 1)
+                if n_features > 1:
+                    segment_length = n_features
+                    segments = segment_signal(filtered_signal, segment_length=segment_length, overlap=0.75)
+                    if len(segments) == 0:
+                        st.error("No se pudieron crear segmentos de la señal para normalizar.")
+                        return None
+                    normalized_segments = scaler.transform(segments)
+                    normalized_signal = normalized_segments.flatten()
+                else:
+                    normalized_signal = scaler.transform(filtered_signal.reshape(-1, 1)).flatten()
             except Exception as e:
                 st.error(f"Error al cargar el scaler: {str(e)}")
                 return None
         else:
             st.error("No se encuentra el archivo del scaler.")
             return None
-        # Cargar modelo con manejo de errores mejorado
+
         try:
             model = load_model(model_path, custom_objects=custom_objects, compile=False)
             model.compile(
@@ -115,40 +99,30 @@ def detect_anomaly_in_ecg(file_path, model_path="infogenerada/ecg_autoencoder_mo
         except Exception as e:
             st.error(f"Error al cargar el modelo: {str(e)}")
             return None
-        # Cargar umbrales
+
         with open('infogenerada/anomaly_threshold.json', 'r') as f:
             thresholds = json.load(f)
         threshold_value = threshold if threshold is not None else thresholds['threshold_normal']
-        # Segmentar señal
         input_shape = model.input_shape[1]
         segments = segment_signal(normalized_signal, segment_length=input_shape, overlap=0.75)
         if len(segments) == 0:
             st.error("No se pudieron crear segmentos de la señal.")
             return None
-        # Analizar segmentos
-        segment_errors = []
-        reconstructed_segments = []
-        for segment in segments:
-            input_segment = segment.reshape(1, input_shape, 1)
-            reconstructed = model.predict(input_segment, verbose=0)[0]
-            reconstructed_segments.append(reconstructed)
-            mse = np.mean(np.square(segment - reconstructed))
-            segment_errors.append(mse)
-        # Calcular estadísticas con ajustes para ser menos sensible
+
+        # Procesar todos los segmentos en batch para máxima velocidad
+        reconstructed_segments = model.predict(segments.reshape(-1, input_shape, 1), verbose=0)
+        # FIX: broadcasting, quitar la última dimensión de reconstructed_segments
+        reconstructed_segments = reconstructed_segments.squeeze(-1)
+        segment_errors = np.mean(np.square(segments - reconstructed_segments), axis=1)
         max_error = np.max(segment_errors)
         mean_error = np.mean(segment_errors)
-        p95_error = np.percentile(segment_errors, 95)
-        # Ajustar umbrales de manera más permisiva
         base_threshold = threshold if threshold is not None else thresholds['threshold_normal']
-        adjusted_threshold = base_threshold * 1.5  # Más tolerante con variaciones normales
-        # Determinar anomalías usando umbrales relativos al promedio
-        is_anomaly = max_error > (mean_error * 3)  # Más tolerante
-        is_severe = max_error > (mean_error * 5)   # Mucho más alto para anomalías severas
+        adjusted_threshold = base_threshold * 1.5
+        is_anomaly = max_error > (mean_error * 3)
+        is_severe = max_error > (mean_error * 5)
         is_mild = (max_error > (mean_error * 2)) and not is_severe and not is_anomaly
-        # Normalizar el score de severidad
-        severity_base = thresholds['threshold_strict'] * 1.5  # Base más alta
+        severity_base = thresholds['threshold_strict'] * 1.5
         severity_score = min(1.0, max_error / severity_base)
-        # Ajustar resultados finales
         results = {
             'is_anomaly': bool(is_anomaly),
             'is_severe_anomaly': bool(is_severe),
@@ -160,7 +134,8 @@ def detect_anomaly_in_ecg(file_path, model_path="infogenerada/ecg_autoencoder_mo
             'threshold_strict': float(thresholds['threshold_strict'] * 1.5),
             'threshold_lenient': float(thresholds['threshold_lenient'] * 1.2),
             'worst_segment': segments[np.argmax(segment_errors)].tolist(),
-            'worst_reconstructed': reconstructed_segments[np.argmax(segment_errors)].tolist()
+            'worst_reconstructed': reconstructed_segments[np.argmax(segment_errors)].tolist(),
+            'segment_errors': segment_errors.tolist()  # Para graficar el error cuadrático
         }
         return results
     except Exception as e:
@@ -175,7 +150,6 @@ def main():
     Esta aplicación permite detectar anomalías en señales de electrocardiograma (ECG) 
     utilizando técnicas de aprendizaje automático con autoencoder. 
     """)
-    # Navegación
     st.sidebar.title("Navegación")
     page = st.sidebar.radio("Ir a", ["Inicio", "Detector de Anomalías", "Entrenamiento", "Acerca de"])
     if page == "Inicio":
@@ -198,7 +172,6 @@ def main():
             st.warning("⚠️ No se ha encontrado un modelo entrenado. Por favor, entrena primero.")
             return
         st.success("✅ Modelo cargado y listo para detectar anomalías.")
-        # Configuración de umbral
         with st.expander("⚙️ Configuración avanzada"):
             try:
                 with open("infogenerada/anomaly_threshold.json", 'r') as f:
@@ -218,7 +191,6 @@ def main():
             Umbral original: {default_threshold:.6f}
             Umbral actual: {custom_threshold:.6f}
             """)
-        # Subida y procesamiento de archivo
         uploaded_file = st.file_uploader("Cargar archivo CSV con datos de ECG", type=["csv"])
         if uploaded_file:
             with tempfile.NamedTemporaryFile(delete=False, suffix='.csv') as tmp_file:
@@ -229,7 +201,6 @@ def main():
                     results = detect_anomaly_in_ecg(temp_path, threshold=custom_threshold)
                     if results:
                         plot_anomaly_results(results, temp_path)
-                        # Opción de descarga con manejo mejorado de tipos
                         download_results = {
                             k: float(v) if isinstance(v, (np.float32, np.float64)) else
                                bool(v) if isinstance(v, np.bool_) else v
@@ -272,17 +243,26 @@ def main():
                 tmp_file.write(uploaded_train_file.getvalue())
                 temp_train_path = tmp_file.name
             if st.button("🚀 Iniciar Entrenamiento"):
-                success = run_training(
-                    temp_train_path,
-                    epochs=epochs,
-                    validation=validation,
-                    segment_length=segment_length,
-                    overlap=overlap
-                )
-                if success:
-                    st.success("✅ Entrenamiento completado exitosamente!")
-                else:
-                    st.error("❌ El entrenamiento falló.")
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                def progress_callback(msg, pct):
+                    status_text.write(msg)
+                    if pct is not None:
+                        progress_bar.progress(min(100, pct))
+                try:
+                    model, history = train_model(
+                        temp_train_path,
+                        epochs=epochs,
+                        validation_split=validation,
+                        segment_length=segment_length,
+                        overlap=overlap,
+                        progress_callback=progress_callback
+                    )
+                    status_text.success("✅ Entrenamiento completado exitosamente!")
+                    progress_bar.progress(100)
+                except Exception as e:
+                    status_text.error(f"❌ Error en el entrenamiento: {e}")
+                    progress_bar.progress(100)
     elif page == "Acerca de":
         st.header("Acerca del Detector")
         st.markdown("""

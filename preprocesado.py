@@ -10,9 +10,7 @@ def extract_features(ecg_signal):
     """Extraer características de la señal ECG con detección mejorada"""
     signal_range = np.max(ecg_signal) - np.min(ecg_signal)
     min_height = 0.4 * signal_range if signal_range > 0 else 0.5
-    
     peaks, properties = find_peaks(ecg_signal, height=min_height, distance=50, prominence=0.3)
-    
     if len(peaks) < 2:
         return {
             "num_peaks": len(peaks),
@@ -25,10 +23,8 @@ def extract_features(ecg_signal):
             "signal_energy": np.sum(np.square(ecg_signal)) if len(ecg_signal) > 0 else 0,
             "peak_prominences": 0
         }
-    
     rr_intervals = np.diff(peaks)
     prominences = properties.get('prominences', np.zeros_like(peaks))
-    
     features = {
         "num_peaks": len(peaks),
         "mean_rr_interval": float(np.mean(rr_intervals)),
